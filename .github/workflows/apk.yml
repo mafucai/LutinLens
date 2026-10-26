@@ -1,0 +1,141 @@
+name: LutinLens APK
+
+# 云端构建：本地零 Android SDK，产物走 Release asset + Actions artifact。
+# 触发：push 到 master / 手动 workflow_dispatch。
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # flutter 在 .gitmodules 里注册过 submodule，但构建不需要它
+          # （SDK 由 subosito/flutter-action 提供），故不做递归检出。
+          submodules: false
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.35.2'
+          channel: stable
+          cache: true
+
+      - name: Show toolchain versions
+        run: |
+          flutter --version
+          java -version
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+
+      - name: Install Android SDK packages
+        run: |
+          set -euo pipefail
+          # FC-013：显式给包名，不用 action 的默认包列表（默认含已下架的 tools）
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$ANDROID_HOME" -name sdkmanager -type f | sort | tail -n1)"
+          fi
+          echo "sdkmanager=$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-36" "build-tools;36.0.0" \
+            || "$SDKMANAGER" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          echo "--- installed build-tools ---"
+          ls "$ANDROID_HOME/build-tools" || true
+          echo "--- installed platforms ---"
+          ls "$ANDROID_HOME/platforms" || true
+
+      - name: Install vendored threeegl AAR into mavenLocal
+        # third_party/flutter_gl-0.0.21/android/build.gradle 用
+        # 'com.threeegl:threeegl:0.0.1' 坐标依赖，源码里没有 mavenLocal 安装步骤，
+        # 这里手工铺 ~/.m2 布局（避免为了装一个 artifact 引入 maven 工具链）。
+        run: |
+          set -euo pipefail
+          GROUP=com/threeegl
+          ART=threeegl
+          VER=0.0.1
+          DST="$HOME/.m2/repository/$GROUP/$ART/$VER"
+          mkdir -p "$DST"
+          AAR=third_party/flutter_gl-0.0.21/android/libs/aars/threeegl.aar
+          test -s "$AAR" || { echo "threeegl.aar 缺失: $AAR"; exit 1; }
+          cp "$AAR" "$DST/$ART-$VER.aar"
+          cp android/maven-repo/com/threeegl/threeegl/0.0.1/threeegl-0.0.1.pom "$DST/$ART-$VER.pom"
+          echo "--- mavenLocal 布局 ---"
+          find "$HOME/.m2/repository/com/threeegl" -type f
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Build release APK
+        run: |
+          set -euo pipefail
+          flutter build apk --release
+          echo "--- 产物 ---"
+          find build/app/outputs -name "*.apk" -type f -exec ls -l {} \;
+
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+          APK=$(find build/app/outputs/flutter-apk -name "app-release.apk" | head -n1)
+          test -f "$APK" || { echo "找不到 app-release.apk"; find build/app/outputs -type f | head -20; exit 1; }
+          SIZE=$(stat -c%s "$APK")
+          echo "APK: $APK  ${SIZE} 字节"
+          # 体积断言：LUT 素材 6.2MB + Flutter 引擎，正常应远大于 15MB
+          if [ "$SIZE" -lt 15000000 ]; then echo "APK 体积异常偏小（$SIZE），疑似废包"; exit 1; fi
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort | tail -n1)"
+          "$APKSIGNER" verify --print-certs "$APK" | head -20
+          unzip -l "$APK" | grep -c "assets/flutter_assets/assets/Luts" || true
+          echo "--- LUT 资源核对 ---"
+          unzip -l "$APK" | grep "assets/Luts" | head -10
+          echo "--- shader 核对 ---"
+          unzip -l "$APK" | grep "gpu_lut" | head -5
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lutinlens-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish Release
+        if: github.ref == 'refs/heads/master'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: lutinlens-build-${{ github.run_number }}
+          name: LutinLens build ${{ github.run_number }}
+          body: |
+            自动构建产物（debug 签名，仅用于验收）。
+            commit: ${{ github.sha }}
+            run: ${{ github.run_id }}
+          files: build/app/outputs/flutter-apk/app-release.apk
+          fail_on_unmatched_files: true
+
+      - name: Collect failure logs
+        if: failure()
+        run: |
+          echo "=== settings.gradle ==="
+          cat android/settings.gradle || true
+          echo "=== app/build.gradle ==="
+          cat android/app/build.gradle || true
+          echo "=== gradle.properties ==="
+          cat android/gradle.properties || true
+          echo "=== local.properties ==="
+          cat android/local.properties 2>/dev/null || echo "(none)"
+          echo "=== build dir ==="
+          find build -maxdepth 3 -type d 2>/dev/null | head -40
